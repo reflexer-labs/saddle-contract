@@ -7,7 +7,7 @@ node_modules/*
 .idea/*
 .eslintcache
 docs
-
+*.code-workspace
 ### macOS ###
 # General
 .DS_Store

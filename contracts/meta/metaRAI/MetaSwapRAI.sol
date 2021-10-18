@@ -2,8 +2,8 @@
 
 pragma solidity 0.6.12;
 
-import "../Swap.sol";
-import "./MetaSwapUtils.sol";
+import "../../Swap.sol";
+import "./MetaSwapUtilsRAI.sol";
 
 /**
  * @title MetaSwap - A StableSwap implementation in solidity.
@@ -28,10 +28,10 @@ import "./MetaSwapUtils.sol";
  * @dev Most of the logic is stored as a library `MetaSwapUtils` for the sake of reducing contract's
  * deployment size.
  */
-contract MetaSwap is Swap {
-    using MetaSwapUtils for SwapUtils.Swap;
+contract MetaSwapRAI is Swap {
+    using MetaSwapUtilsRAI for SwapUtils.Swap;
 
-    MetaSwapUtils.MetaSwap public metaSwapStorage;
+    MetaSwapUtilsRAI.MetaSwap public metaSwapStorage;
 
     uint256 constant MAX_UINT256 = 2**256 - 1;
 
@@ -58,7 +58,7 @@ contract MetaSwap is Swap {
         override
         returns (uint256)
     {
-        return MetaSwapUtils.getVirtualPrice(swapStorage, metaSwapStorage);
+        return MetaSwapUtilsRAI.getVirtualPrice(swapStorage, metaSwapStorage);
     }
 
     /**
@@ -75,7 +75,7 @@ contract MetaSwap is Swap {
         uint256 dx
     ) external view virtual override returns (uint256) {
         return
-            MetaSwapUtils.calculateSwap(
+            MetaSwapUtilsRAI.calculateSwap(
                 swapStorage,
                 metaSwapStorage,
                 tokenIndexFrom,
@@ -99,7 +99,7 @@ contract MetaSwap is Swap {
         uint256 dx
     ) external view virtual returns (uint256) {
         return
-            MetaSwapUtils.calculateSwapUnderlying(
+            MetaSwapUtilsRAI.calculateSwapUnderlying(
                 swapStorage,
                 metaSwapStorage,
                 tokenIndexFrom,
@@ -131,7 +131,7 @@ contract MetaSwap is Swap {
         returns (uint256)
     {
         return
-            MetaSwapUtils.calculateTokenAmount(
+            MetaSwapUtilsRAI.calculateTokenAmount(
                 swapStorage,
                 metaSwapStorage,
                 amounts,
@@ -152,7 +152,7 @@ contract MetaSwap is Swap {
         uint8 tokenIndex
     ) external view virtual override returns (uint256) {
         return
-            MetaSwapUtils.calculateWithdrawOneToken(
+            MetaSwapUtilsRAI.calculateWithdrawOneToken(
                 swapStorage,
                 metaSwapStorage,
                 tokenAmount,
@@ -221,8 +221,10 @@ contract MetaSwap is Swap {
         uint256 _fee,
         uint256 _adminFee,
         address lpTokenTargetAddress,
-        ISwap baseSwap
-
+        ISwap baseSwap,
+        address redemptionPriceFeed,
+        uint8 redemptionPricePrecisionDiff
+        
     ) external virtual initializer {
         Swap.initialize(
             _pooledTokens,
@@ -239,7 +241,8 @@ contract MetaSwap is Swap {
         metaSwapStorage.baseSwap = baseSwap;
         metaSwapStorage.baseVirtualPrice = baseSwap.getVirtualPrice();
         metaSwapStorage.baseCacheLastUpdated = block.timestamp;
-        
+        metaSwapStorage.redemptionPriceFeed = redemptionPriceFeed;
+        metaSwapStorage.redemptionPricePrecisionDiff = redemptionPricePrecisionDiff;
 
         // Read all tokens that belong to baseSwap
         {
@@ -290,7 +293,7 @@ contract MetaSwap is Swap {
         returns (uint256)
     {
         return
-            MetaSwapUtils.swap(
+            MetaSwapUtilsRAI.swap(
                 swapStorage,
                 metaSwapStorage,
                 tokenIndexFrom,
@@ -323,7 +326,7 @@ contract MetaSwap is Swap {
         returns (uint256)
     {
         return
-            MetaSwapUtils.swapUnderlying(
+            MetaSwapUtilsRAI.swapUnderlying(
                 swapStorage,
                 metaSwapStorage,
                 tokenIndexFrom,
@@ -355,7 +358,7 @@ contract MetaSwap is Swap {
         returns (uint256)
     {
         return
-            MetaSwapUtils.addLiquidity(
+            MetaSwapUtilsRAI.addLiquidity(
                 swapStorage,
                 metaSwapStorage,
                 amounts,
@@ -387,7 +390,7 @@ contract MetaSwap is Swap {
         returns (uint256)
     {
         return
-            MetaSwapUtils.removeLiquidityOneToken(
+            MetaSwapUtilsRAI.removeLiquidityOneToken(
                 swapStorage,
                 metaSwapStorage,
                 tokenAmount,
@@ -420,7 +423,7 @@ contract MetaSwap is Swap {
         returns (uint256)
     {
         return
-            MetaSwapUtils.removeLiquidityImbalance(
+            MetaSwapUtilsRAI.removeLiquidityImbalance(
                 swapStorage,
                 metaSwapStorage,
                 amounts,
