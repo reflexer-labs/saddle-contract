@@ -212,6 +212,7 @@ contract DriftingMetaSwap is Swap {
      * StableSwap paper for details
      * @param _fee default swap fee to be initialized with
      * @param _adminFee default adminFee to be initialized with
+     * @param redemptionPriceGetter address of contract to read redemption price snapshot from
      */
     function initializeDriftingMetaSwap(
         IERC20[] memory _pooledTokens,
@@ -222,8 +223,9 @@ contract DriftingMetaSwap is Swap {
         uint256 _fee,
         uint256 _adminFee,
         address lpTokenTargetAddress,
-        ISwap baseSwap
-    ) external virtual initializer {
+        ISwap baseSwap,
+        IRedemptionPriceGetter redemptionPriceGetter
+) external virtual initializer {
         Swap.initialize(
             _pooledTokens,
             decimals,
@@ -239,6 +241,7 @@ contract DriftingMetaSwap is Swap {
         driftingMetaSwapStorage.baseSwap = baseSwap;
         driftingMetaSwapStorage.baseVirtualPrice = baseSwap.getVirtualPrice();
         driftingMetaSwapStorage.baseCacheLastUpdated = block.timestamp;
+        driftingMetaSwapStorage.redemptionPriceGetter = redemptionPriceGetter;
 
         // Read all tokens that belong to baseSwap
         {

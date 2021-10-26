@@ -5,7 +5,7 @@ pragma solidity 0.6.12;
 contract RedemptionPriceSnapMock {
     uint256 internal internalSnappedRedemptionPrice;
 
-    constructor() {
+    constructor() public {
         // Set redemption price to $1 (ray) so existing common tests which expect pegged coin can run.
         internalSnappedRedemptionPrice = 1000000000000000000000000000;
     }

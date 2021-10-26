@@ -4,6 +4,7 @@ pragma solidity 0.6.12;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "./ISwap.sol";
+import "./IRedemptionPriceGetter.sol";
 
 interface IDriftingMetaSwap {
     // pool data view functions
@@ -68,7 +69,8 @@ interface IDriftingMetaSwap {
         uint256 _fee,
         uint256 _adminFee,
         address lpTokenTargetAddress,
-        ISwap baseSwap
+        ISwap baseSwap,
+        IRedemptionPriceGetter redemptionPriceGetter
     ) external;
 
     function swap(

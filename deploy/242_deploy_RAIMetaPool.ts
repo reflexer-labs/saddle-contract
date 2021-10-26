@@ -56,6 +56,9 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
       (
         await get("SaddleUSDPoolV2")
       ).address,
+      (
+        await get("RedemptionPriceSnapMock")
+      ).address,
     )
 
     await execute(

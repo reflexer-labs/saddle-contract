@@ -5,17 +5,18 @@ pragma solidity 0.6.12;
 import "@openzeppelin/contracts/math/SafeMath.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "../LPToken.sol";
+import "../interfaces/IRedemptionPriceGetter.sol";
 import "../interfaces/ISwap.sol";
 import "../MathUtils.sol";
 import "../SwapUtils.sol";
 
 /**
  * @title DriftingMetaSwapUtils library
- * @notice A library to be used within DriftingMetaSwap.sol. Contains functions responsible for custody and AMM functionalities.
+ * @notice A library to be used within DriftingMetaSwap.sol. Contains functions responsible for custody and AMM
+ * functionalities.
  *
- * DriftingMetaSwap is a modified version of Swap that allows Swap's LP token to be utilized in pooling with other tokens.
- * As an example, if there is a Swap pool consisting of [DAI, USDC, USDT]. Then a DriftingMetaSwap pool can be created
- * with [sUSD, BaseSwapLPToken] to allow trades between either the LP token or the underlying tokens and sUSD.
+ * DriftingMetaSwap is a modified version of MetaSwap that allows an asset with a drifting target price to be used to
+ * trade against the base LP token.
  *
  * @dev Contracts relying on this library must initialize SwapUtils.Swap struct then use this library
  * for SwapUtils.Swap struct. Note that this library contains both functions called by users and admins.
@@ -71,6 +72,7 @@ library DriftingMetaSwapUtils {
     struct DriftingMetaSwap {
         // Meta-Swap related parameters
         ISwap baseSwap;
+        IRedemptionPriceGetter redemptionPriceGetter;
         uint256 baseVirtualPrice;
         uint256 baseCacheLastUpdated;
         IERC20[] baseTokens;
@@ -85,6 +87,8 @@ library DriftingMetaSwapUtils {
         uint256 feePerToken;
         uint256 preciseA;
         uint256 xpi;
+        uint256 i;
+        uint256 dy;
     }
 
     // Struct storing variables used in calculation in removeLiquidityImbalance function
@@ -97,15 +101,30 @@ library DriftingMetaSwapUtils {
         uint256 totalSupply;
         uint256 preciseA;
         uint256 baseVirtualPrice;
-        uint256[] tokenPrecisionMultipliers;
+        uint256[] scaleMultipliers;
         uint256[] newBalances;
+    }
+
+    struct CalculateTokenAmountInfo {
+        uint256 a;
+        uint256 d0;
+        uint256 d1;
+        uint256 baseVirtualPrice;
+    }
+
+    struct SwapInfo {
+        uint256 transferredDx;
+        uint256 dyAdminFee;
+        uint256 dy;
+        uint256 dyFee;
+        uint256[] scaleMultipliers;
     }
 
     struct SwapUnderlyingInfo {
         uint256 x;
         uint256 dx;
         uint256 dy;
-        uint256[] tokenPrecisionMultipliers;
+        uint256[] scaleMultipliers;
         uint256[] oldBalances;
         IERC20[] baseTokens;
         IERC20 tokenFrom;
@@ -118,7 +137,6 @@ library DriftingMetaSwapUtils {
     struct CalculateSwapUnderlyingInfo {
         uint256 baseVirtualPrice;
         ISwap baseSwap;
-        uint8 baseLPTokenIndex;
         uint8 baseTokensLength;
         uint8 metaIndexTo;
         uint256 x;
@@ -131,9 +149,34 @@ library DriftingMetaSwapUtils {
 
     // Cache expire time for the stored value of base Swap's virtual price
     uint256 public constant BASE_CACHE_EXPIRE_TIME = 10 minutes;
-    uint256 public constant BASE_VIRTUAL_PRICE_PRECISION = 10**18;
+    uint256 public constant PRECISION = 10**18;
+
+    // The precision used by the quasi oracle for the drifting assets target price
+    uint256 public constant REDEMPTION_PRICE_EXTRA_PRECISION = 10**9;
+    uint256 public constant DRIFT_ASSET_INDEX = 0;
+    uint8 public constant BASE_LP_TOKEN_INDEX = 1;  // There are always two tokens in a meta pool
+    uint256 public constant NUM_META_TOKENS = 2;
 
     /*** VIEW & PURE FUNCTIONS ***/
+
+    /**
+     * @notice Get multipliers to scale for the precision used by the two tokens and account for the redemption price of
+     * the drifting asset.
+     * @param self Swap struct to read from
+     * @param driftingMetaSwapStorage DriftingMetaSwap struct to read from
+     */
+    function _getScaleMultipliers(
+        SwapUtils.Swap storage self,
+        DriftingMetaSwap storage driftingMetaSwapStorage
+    ) internal view returns (uint256[] memory) {
+        uint256[] memory scaleMultipliers = self.tokenPrecisionMultipliers;
+        scaleMultipliers[DRIFT_ASSET_INDEX] = scaleMultipliers[DRIFT_ASSET_INDEX]
+            .mul(driftingMetaSwapStorage.redemptionPriceGetter.snappedRedemptionPrice())
+            .div(REDEMPTION_PRICE_EXTRA_PRECISION);
+        scaleMultipliers[BASE_LP_TOKEN_INDEX] = scaleMultipliers[BASE_LP_TOKEN_INDEX]
+            .mul(PRECISION);
+        return scaleMultipliers;
+    }
 
     /**
      * @notice Return the stored value of base Swap's virtual price. If
@@ -172,6 +215,7 @@ library DriftingMetaSwapUtils {
     ) external view returns (uint256 dy) {
         (dy, ) = _calculateWithdrawOneToken(
             self,
+            driftingMetaSwapStorage,
             tokenAmount,
             tokenIndex,
             _getBaseVirtualPrice(driftingMetaSwapStorage),
@@ -181,6 +225,7 @@ library DriftingMetaSwapUtils {
 
     function _calculateWithdrawOneToken(
         SwapUtils.Swap storage self,
+        DriftingMetaSwap storage driftingMetaSwapStorage,
         uint256 tokenAmount,
         uint8 tokenIndex,
         uint256 baseVirtualPrice,
@@ -192,10 +237,12 @@ library DriftingMetaSwapUtils {
         {
             uint256 currentY;
             uint256 newY;
+            uint256[] memory scaleMultipliers = _getScaleMultipliers(self, driftingMetaSwapStorage);
 
             // Calculate how much to withdraw
             (dy, newY, currentY) = _calculateWithdrawOneTokenDY(
                 self,
+                driftingMetaSwapStorage,
                 tokenIndex,
                 tokenAmount,
                 baseVirtualPrice,
@@ -205,7 +252,8 @@ library DriftingMetaSwapUtils {
             // Calculate the associated swap fee
             dySwapFee = currentY
                 .sub(newY)
-                .div(self.tokenPrecisionMultipliers[tokenIndex])
+                .mul(PRECISION)
+                .div(scaleMultipliers[tokenIndex])
                 .sub(dy);
         }
 
@@ -215,6 +263,7 @@ library DriftingMetaSwapUtils {
     /**
      * @notice Calculate the dy of withdrawing in one token
      * @param self Swap struct to read from
+     * @param driftingMetaSwapStorage DriftingMetaSwap struct to read from
      * @param tokenIndex which token will be withdrawn
      * @param tokenAmount the amount to withdraw in the pools precision
      * @param baseVirtualPrice the virtual price of the base swap's LP token
@@ -222,6 +271,7 @@ library DriftingMetaSwapUtils {
      */
     function _calculateWithdrawOneTokenDY(
         SwapUtils.Swap storage self,
+        DriftingMetaSwap storage driftingMetaSwapStorage,
         uint8 tokenIndex,
         uint256 tokenAmount,
         uint256 baseVirtualPrice,
@@ -237,7 +287,7 @@ library DriftingMetaSwapUtils {
     {
         // Get the current D, then solve the stableswap invariant
         // y_i for D - tokenAmount
-        uint256[] memory xp = _xp(self, baseVirtualPrice);
+        uint256[] memory xp = _xp(self, driftingMetaSwapStorage, baseVirtualPrice);
         require(tokenIndex < xp.length, "Token index out of range");
 
         CalculateWithdrawOneTokenDYInfo
@@ -247,6 +297,8 @@ library DriftingMetaSwapUtils {
                 0,
                 0,
                 self._getAPrecise(),
+                0,
+                0,
                 0
             );
         v.d0 = SwapUtils.getD(xp, v.preciseA);
@@ -257,32 +309,33 @@ library DriftingMetaSwapUtils {
         v.newY = SwapUtils.getYD(v.preciseA, tokenIndex, xp, v.d1);
 
         uint256[] memory xpReduced = new uint256[](xp.length);
+        uint256[] memory scaleMultipliers = _getScaleMultipliers(self, driftingMetaSwapStorage);
 
         v.feePerToken = SwapUtils._feePerToken(self.swapFee, xp.length);
-        for (uint256 i = 0; i < xp.length; i++) {
-            v.xpi = xp[i];
+        for (v.i = 0; v.i < xp.length; v.i++) {
+            v.xpi = xp[v.i];
             // if i == tokenIndex, dxExpected = xp[i] * d1 / d0 - newY
             // else dxExpected = xp[i] - (xp[i] * d1 / d0)
             // xpReduced[i] -= dxExpected * fee / FEE_DENOMINATOR
-            xpReduced[i] = v.xpi.sub(
+            xpReduced[v.i] = v.xpi.sub(
                 (
-                    (i == tokenIndex)
+                    (v.i == tokenIndex)
                         ? v.xpi.mul(v.d1).div(v.d0).sub(v.newY)
                         : v.xpi.sub(v.xpi.mul(v.d1).div(v.d0))
                 ).mul(v.feePerToken).div(FEE_DENOMINATOR)
             );
         }
 
-        uint256 dy = xpReduced[tokenIndex].sub(
+        v.dy = xpReduced[tokenIndex].sub(
             SwapUtils.getYD(v.preciseA, tokenIndex, xpReduced, v.d1)
         );
 
         if (tokenIndex == xp.length.sub(1)) {
-            dy = dy.mul(BASE_VIRTUAL_PRICE_PRECISION).div(baseVirtualPrice);
+            v.dy = v.dy.mul(PRECISION).div(baseVirtualPrice);
         }
-        dy = dy.sub(1).div(self.tokenPrecisionMultipliers[tokenIndex]);
+        v.dy = v.dy.sub(1).mul(PRECISION).div(scaleMultipliers[tokenIndex]);
 
-        return (dy, v.newY, xp[tokenIndex]);
+        return (v.dy, v.newY, xp[tokenIndex]);
     }
 
     /**
@@ -293,9 +346,10 @@ library DriftingMetaSwapUtils {
      * @param balances an array of token balances, in their native precisions.
      * These should generally correspond with pooled tokens.
      *
-     * @param precisionMultipliers an array of multipliers, corresponding to
+     * @param scaleMultipliers an array of multipliers, corresponding to
      * the amounts in the balances array. When multiplied together they
-     * should yield amounts at the pool's precision.
+     * should yield amounts at the pool's precision and scale for the drifting
+     * assets target price.
      *
      * @param baseVirtualPrice the base virtual price to scale the balance of the
      * base Swap's LP token.
@@ -304,24 +358,27 @@ library DriftingMetaSwapUtils {
      */
     function _xp(
         uint256[] memory balances,
-        uint256[] memory precisionMultipliers,
+        uint256[] memory scaleMultipliers,
         uint256 baseVirtualPrice
     ) internal pure returns (uint256[] memory) {
-        uint256[] memory xp = SwapUtils._xp(balances, precisionMultipliers);
-        uint256 baseLPTokenIndex = balances.length.sub(1);
-        xp[baseLPTokenIndex] = xp[baseLPTokenIndex].mul(baseVirtualPrice).div(
-            BASE_VIRTUAL_PRICE_PRECISION
-        );
+        uint256[] memory xp = new uint256[](NUM_META_TOKENS);
+        xp[DRIFT_ASSET_INDEX] = balances[DRIFT_ASSET_INDEX].mul(scaleMultipliers[DRIFT_ASSET_INDEX]).div(PRECISION);
+        xp[BASE_LP_TOKEN_INDEX] = balances[BASE_LP_TOKEN_INDEX].mul(baseVirtualPrice).div(PRECISION);
         return xp;
     }
 
     /**
      * @notice Return the precision-adjusted balances of all tokens in the pool
      * @param self Swap struct to read from
+     * @param driftingMetaSwapStorage DriftingMetaSwap struct to read from
      * @return the pool balances "scaled" to the pool's precision, allowing
      * them to be more easily compared.
      */
-    function _xp(SwapUtils.Swap storage self, uint256 baseVirtualPrice)
+    function _xp(
+        SwapUtils.Swap storage self,
+        DriftingMetaSwap storage driftingMetaSwapStorage,
+        uint256 baseVirtualPrice
+    )
         internal
         view
         returns (uint256[] memory)
@@ -329,7 +386,7 @@ library DriftingMetaSwapUtils {
         return
             _xp(
                 self.balances,
-                self.tokenPrecisionMultipliers,
+                _getScaleMultipliers(self, driftingMetaSwapStorage),
                 baseVirtualPrice
             );
     }
@@ -338,7 +395,7 @@ library DriftingMetaSwapUtils {
      * @notice Get the virtual price, to help calculate profit
      * @param self Swap struct to read from
      * @param driftingMetaSwapStorage DriftingMetaSwap struct to read from
-     * @return the virtual price, scaled to precision of BASE_VIRTUAL_PRICE_PRECISION
+     * @return the virtual price, scaled to precision of PRECISION
      */
     function getVirtualPrice(
         SwapUtils.Swap storage self,
@@ -347,14 +404,14 @@ library DriftingMetaSwapUtils {
         uint256 d = SwapUtils.getD(
             _xp(
                 self.balances,
-                self.tokenPrecisionMultipliers,
+                _getScaleMultipliers(self, driftingMetaSwapStorage),
                 _getBaseVirtualPrice(driftingMetaSwapStorage)
             ),
             self._getAPrecise()
         );
         uint256 supply = self.lpToken.totalSupply();
         if (supply != 0) {
-            return d.mul(BASE_VIRTUAL_PRICE_PRECISION).div(supply);
+            return d.mul(PRECISION).div(supply);
         }
         return 0;
     }
@@ -379,6 +436,7 @@ library DriftingMetaSwapUtils {
     ) external view returns (uint256 dy) {
         (dy, ) = _calculateSwap(
             self,
+            driftingMetaSwapStorage,
             tokenIndexFrom,
             tokenIndexTo,
             dx,
@@ -393,6 +451,7 @@ library DriftingMetaSwapUtils {
      * using the token contracts.
      *
      * @param self Swap struct to read from
+     * @param driftingMetaSwapStorage DriftingMetaSwap struct to read from
      * @param tokenIndexFrom the token to sell
      * @param tokenIndexTo the token to buy
      * @param dx the number of tokens to sell. If the token charges a fee on transfers,
@@ -402,19 +461,20 @@ library DriftingMetaSwapUtils {
      */
     function _calculateSwap(
         SwapUtils.Swap storage self,
+        DriftingMetaSwap storage driftingMetaSwapStorage,
         uint8 tokenIndexFrom,
         uint8 tokenIndexTo,
         uint256 dx,
         uint256 baseVirtualPrice
     ) internal view returns (uint256 dy, uint256 dyFee) {
-        uint256[] memory xp = _xp(self, baseVirtualPrice);
+        uint256[] memory xp = _xp(self, driftingMetaSwapStorage, baseVirtualPrice);
         require(
             tokenIndexFrom < xp.length && tokenIndexTo < xp.length,
             "Token index out of range"
         );
-        uint256 x = dx.mul(self.tokenPrecisionMultipliers[tokenIndexFrom]).add(
-            xp[tokenIndexFrom]
-        );
+        uint256[] memory scaleMultipliers = _getScaleMultipliers(self, driftingMetaSwapStorage);
+        uint256 x = dx.mul(scaleMultipliers[tokenIndexFrom]).div(PRECISION);
+        x = x.add(xp[tokenIndexFrom]);
         uint256 y = SwapUtils.getY(
             self._getAPrecise(),
             tokenIndexFrom,
@@ -424,7 +484,7 @@ library DriftingMetaSwapUtils {
         );
         dy = xp[tokenIndexTo].sub(y).sub(1);
         dyFee = dy.mul(self.swapFee).div(FEE_DENOMINATOR);
-        dy = dy.sub(dyFee).div(self.tokenPrecisionMultipliers[tokenIndexTo]);
+        dy = dy.sub(dyFee).mul(PRECISION).div(scaleMultipliers[tokenIndexTo]);
     }
 
     /**
@@ -449,54 +509,49 @@ library DriftingMetaSwapUtils {
         CalculateSwapUnderlyingInfo memory v = CalculateSwapUnderlyingInfo(
             _getBaseVirtualPrice(driftingMetaSwapStorage),
             driftingMetaSwapStorage.baseSwap,
-            0,
             uint8(driftingMetaSwapStorage.baseTokens.length),
             0,
             0,
             0
         );
 
-        uint256[] memory xp = _xp(self, v.baseVirtualPrice);
-        v.baseLPTokenIndex = uint8(xp.length.sub(1));
+        uint256[] memory xp = _xp(self, driftingMetaSwapStorage, v.baseVirtualPrice);
+        uint256[] memory scaleMultipliers = _getScaleMultipliers(self, driftingMetaSwapStorage);
         {
-            uint8 maxRange = v.baseLPTokenIndex + v.baseTokensLength;
+            uint8 maxRange = BASE_LP_TOKEN_INDEX + v.baseTokensLength;
             require(
                 tokenIndexFrom < maxRange && tokenIndexTo < maxRange,
                 "Token index out of range"
             );
         }
-
-        if (tokenIndexFrom < v.baseLPTokenIndex) {
-            // tokenFrom is from this pool
-            v.x = xp[tokenIndexFrom].add(
-                dx.mul(self.tokenPrecisionMultipliers[tokenIndexFrom])
-            );
+        if (tokenIndexFrom < BASE_LP_TOKEN_INDEX) {
+            v.x = xp[tokenIndexFrom].add(dx.mul(scaleMultipliers[tokenIndexFrom]).div(PRECISION));
         } else {
             // tokenFrom is from the base pool
-            tokenIndexFrom = tokenIndexFrom - v.baseLPTokenIndex;
-            if (tokenIndexTo < v.baseLPTokenIndex) {
+            tokenIndexFrom = tokenIndexFrom - BASE_LP_TOKEN_INDEX;
+            if (tokenIndexTo < BASE_LP_TOKEN_INDEX) {
                 uint256[] memory baseInputs = new uint256[](v.baseTokensLength);
                 baseInputs[tokenIndexFrom] = dx;
                 v.x = v
                     .baseSwap
                     .calculateTokenAmount(baseInputs, true)
                     .mul(v.baseVirtualPrice)
-                    .div(BASE_VIRTUAL_PRICE_PRECISION)
-                    .add(xp[v.baseLPTokenIndex]);
+                    .div(PRECISION)
+                    .add(xp[BASE_LP_TOKEN_INDEX]);
             } else {
                 // both from and to are from the base pool
                 return
                     v.baseSwap.calculateSwap(
                         tokenIndexFrom,
-                        tokenIndexTo - v.baseLPTokenIndex,
+                        tokenIndexTo - BASE_LP_TOKEN_INDEX,
                         dx
                     );
             }
-            tokenIndexFrom = v.baseLPTokenIndex;
+            tokenIndexFrom = BASE_LP_TOKEN_INDEX;
         }
 
-        v.metaIndexTo = v.baseLPTokenIndex;
-        if (tokenIndexTo < v.baseLPTokenIndex) {
+        v.metaIndexTo = BASE_LP_TOKEN_INDEX;
+        if (tokenIndexTo < BASE_LP_TOKEN_INDEX) {
             v.metaIndexTo = tokenIndexTo;
         }
 
@@ -513,14 +568,14 @@ library DriftingMetaSwapUtils {
             v.dy = v.dy.sub(dyFee);
         }
 
-        if (tokenIndexTo < v.baseLPTokenIndex) {
+        if (tokenIndexTo < BASE_LP_TOKEN_INDEX) {
             // tokenTo is from this pool
-            v.dy = v.dy.div(self.tokenPrecisionMultipliers[v.metaIndexTo]);
+            v.dy = v.dy.mul(PRECISION).div(scaleMultipliers[v.metaIndexTo]);
         } else {
             // tokenTo is from the base pool
             v.dy = v.baseSwap.calculateRemoveLiquidityOneToken(
-                v.dy.mul(BASE_VIRTUAL_PRICE_PRECISION).div(v.baseVirtualPrice),
-                tokenIndexTo - v.baseLPTokenIndex
+                v.dy.mul(PRECISION).div(v.baseVirtualPrice),
+                tokenIndexTo - BASE_LP_TOKEN_INDEX
             );
         }
 
@@ -551,18 +606,24 @@ library DriftingMetaSwapUtils {
         uint256[] calldata amounts,
         bool deposit
     ) external view returns (uint256) {
-        uint256 a = self._getAPrecise();
-        uint256 d0;
-        uint256 d1;
+        CalculateTokenAmountInfo memory v = CalculateTokenAmountInfo(
+            self._getAPrecise(),
+            0,
+            0,
+            _getBaseVirtualPrice(driftingMetaSwapStorage)
+        );
+
         {
-            uint256 baseVirtualPrice = _getBaseVirtualPrice(driftingMetaSwapStorage);
             uint256[] memory balances1 = self.balances;
-            uint256[] memory tokenPrecisionMultipliers = self
-                .tokenPrecisionMultipliers;
+            uint256[] memory scaleMultipliers = _getScaleMultipliers(self, driftingMetaSwapStorage);
             uint256 numTokens = balances1.length;
-            d0 = SwapUtils.getD(
-                _xp(balances1, tokenPrecisionMultipliers, baseVirtualPrice),
-                a
+            v.d0 = SwapUtils.getD(
+                _xp(
+                    balances1,
+                    scaleMultipliers,
+                    v.baseVirtualPrice
+                ),
+                v.a
             );
             for (uint256 i = 0; i < numTokens; i++) {
                 if (deposit) {
@@ -574,17 +635,21 @@ library DriftingMetaSwapUtils {
                     );
                 }
             }
-            d1 = SwapUtils.getD(
-                _xp(balances1, tokenPrecisionMultipliers, baseVirtualPrice),
-                a
+            v.d1 = SwapUtils.getD(
+                _xp(
+                    balances1,
+                    scaleMultipliers,
+                    v.baseVirtualPrice
+                ),
+                v.a
             );
         }
         uint256 totalSupply = self.lpToken.totalSupply();
 
         if (deposit) {
-            return d1.sub(d0).mul(totalSupply).div(d0);
+            return v.d1.sub(v.d0).mul(totalSupply).div(v.d0);
         } else {
-            return d0.sub(d1).mul(totalSupply).div(d0);
+            return v.d0.sub(v.d1).mul(totalSupply).div(v.d0);
         }
     }
 
@@ -608,6 +673,13 @@ library DriftingMetaSwapUtils {
         uint256 dx,
         uint256 minDy
     ) external returns (uint256) {
+        SwapInfo memory v = SwapInfo(
+            0,
+            0,
+            0,
+            0,
+            _getScaleMultipliers(self, driftingMetaSwapStorage)
+        );
         {
             uint256 pooledTokensLength = self.pooledTokens.length;
             require(
@@ -617,7 +689,6 @@ library DriftingMetaSwapUtils {
             );
         }
 
-        uint256 transferredDx;
         {
             IERC20 tokenFrom = self.pooledTokens[tokenIndexFrom];
             require(
@@ -631,43 +702,44 @@ library DriftingMetaSwapUtils {
                 tokenFrom.safeTransferFrom(msg.sender, address(this), dx);
 
                 // Use the actual transferred amount for AMM math
-                transferredDx = tokenFrom.balanceOf(address(this)).sub(
+                v.transferredDx = tokenFrom.balanceOf(address(this)).sub(
                     beforeBalance
                 );
             }
         }
 
-        (uint256 dy, uint256 dyFee) = _calculateSwap(
+        (v.dy, v.dyFee) = _calculateSwap(
             self,
+            driftingMetaSwapStorage,
             tokenIndexFrom,
             tokenIndexTo,
-            transferredDx,
+            v.transferredDx,
             _updateBaseVirtualPrice(driftingMetaSwapStorage)
         );
-        require(dy >= minDy, "Swap didn't result in min tokens");
+        require(v.dy >= minDy, "Swap didn't result in min tokens");
 
-        uint256 dyAdminFee = dyFee.mul(self.adminFee).div(FEE_DENOMINATOR).div(
-            self.tokenPrecisionMultipliers[tokenIndexTo]
+        v.dyAdminFee = v.dyFee.mul(self.adminFee).div(FEE_DENOMINATOR).mul(PRECISION).div(
+            v.scaleMultipliers[tokenIndexTo]
         );
 
         self.balances[tokenIndexFrom] = self.balances[tokenIndexFrom].add(
-            transferredDx
+            v.transferredDx
         );
-        self.balances[tokenIndexTo] = self.balances[tokenIndexTo].sub(dy).sub(
-            dyAdminFee
+        self.balances[tokenIndexTo] = self.balances[tokenIndexTo].sub(v.dy).sub(
+            v.dyAdminFee
         );
 
-        self.pooledTokens[tokenIndexTo].safeTransfer(msg.sender, dy);
+        self.pooledTokens[tokenIndexTo].safeTransfer(msg.sender, v.dy);
 
         emit TokenSwap(
             msg.sender,
-            transferredDx,
-            dy,
+            v.transferredDx,
+                v.dy,
             tokenIndexFrom,
             tokenIndexTo
         );
 
-        return dy;
+        return v.dy;
     }
 
     /**
@@ -696,7 +768,7 @@ library DriftingMetaSwapUtils {
             0,
             0,
             0,
-            self.tokenPrecisionMultipliers,
+            _getScaleMultipliers(self, driftingMetaSwapStorage),
             self.balances,
             driftingMetaSwapStorage.baseTokens,
             IERC20(address(0)),
@@ -706,10 +778,8 @@ library DriftingMetaSwapUtils {
             _updateBaseVirtualPrice(driftingMetaSwapStorage)
         );
 
-        uint8 baseLPTokenIndex = uint8(v.oldBalances.length.sub(1));
-
         {
-            uint8 maxRange = uint8(baseLPTokenIndex + v.baseTokens.length);
+            uint8 maxRange = uint8(BASE_LP_TOKEN_INDEX + v.baseTokens.length);
             require(
                 tokenIndexFrom < maxRange && tokenIndexTo < maxRange,
                 "Token index out of range"
@@ -719,21 +789,21 @@ library DriftingMetaSwapUtils {
         ISwap baseSwap = driftingMetaSwapStorage.baseSwap;
 
         // Find the address of the token swapping from and the index in DriftingMetaSwap's token list
-        if (tokenIndexFrom < baseLPTokenIndex) {
+        if (tokenIndexFrom < BASE_LP_TOKEN_INDEX) {
             v.tokenFrom = self.pooledTokens[tokenIndexFrom];
             v.metaIndexFrom = tokenIndexFrom;
         } else {
-            v.tokenFrom = v.baseTokens[tokenIndexFrom - baseLPTokenIndex];
-            v.metaIndexFrom = baseLPTokenIndex;
+            v.tokenFrom = v.baseTokens[tokenIndexFrom - BASE_LP_TOKEN_INDEX];
+            v.metaIndexFrom = BASE_LP_TOKEN_INDEX;
         }
 
         // Find the address of the token swapping to and the index in DriftingMetaSwap's token list
-        if (tokenIndexTo < baseLPTokenIndex) {
+        if (tokenIndexTo < BASE_LP_TOKEN_INDEX) {
             v.tokenTo = self.pooledTokens[tokenIndexTo];
             v.metaIndexTo = tokenIndexTo;
         } else {
-            v.tokenTo = v.baseTokens[tokenIndexTo - baseLPTokenIndex];
-            v.metaIndexTo = baseLPTokenIndex;
+            v.tokenTo = v.baseTokens[tokenIndexTo - BASE_LP_TOKEN_INDEX];
+            v.metaIndexTo = BASE_LP_TOKEN_INDEX;
         }
 
         // Check for possible fee on transfer
@@ -742,19 +812,19 @@ library DriftingMetaSwapUtils {
         v.dx = v.tokenFrom.balanceOf(address(this)).sub(v.dx); // update dx in case of fee on transfer
 
         if (
-            tokenIndexFrom < baseLPTokenIndex || tokenIndexTo < baseLPTokenIndex
+            tokenIndexFrom < BASE_LP_TOKEN_INDEX || tokenIndexTo < BASE_LP_TOKEN_INDEX
         ) {
             // Either one of the tokens belongs to the DriftingMetaSwap tokens list
             uint256[] memory xp = _xp(
                 v.oldBalances,
-                v.tokenPrecisionMultipliers,
+                v.scaleMultipliers,
                 v.baseVirtualPrice
             );
 
-            if (tokenIndexFrom < baseLPTokenIndex) {
+            if (tokenIndexFrom < BASE_LP_TOKEN_INDEX) {
                 // Swapping from a DriftingMetaSwap token
                 v.x = xp[tokenIndexFrom].add(
-                    dx.mul(v.tokenPrecisionMultipliers[tokenIndexFrom])
+                    dx.mul(v.scaleMultipliers[tokenIndexFrom]).div(PRECISION)
                 );
             } else {
                 // Swapping from a base Swap token
@@ -763,7 +833,7 @@ library DriftingMetaSwapUtils {
                 uint256[] memory baseAmounts = new uint256[](
                     v.baseTokens.length
                 );
-                baseAmounts[tokenIndexFrom - baseLPTokenIndex] = v.dx;
+                baseAmounts[tokenIndexFrom - BASE_LP_TOKEN_INDEX] = v.dx;
 
                 // Add liquidity to the underlying Swap contract and receive base LP token
                 v.dx = baseSwap.addLiquidity(baseAmounts, 0, block.timestamp);
@@ -772,8 +842,8 @@ library DriftingMetaSwapUtils {
                 v.x = v
                     .dx
                     .mul(v.baseVirtualPrice)
-                    .div(BASE_VIRTUAL_PRICE_PRECISION)
-                    .add(xp[baseLPTokenIndex]);
+                    .div(PRECISION)
+                    .add(xp[BASE_LP_TOKEN_INDEX]);
             }
 
             // Calculate how much to withdraw in DriftingMetaSwap level and the the associated swap fee
@@ -788,14 +858,11 @@ library DriftingMetaSwapUtils {
                 );
                 v.dy = xp[v.metaIndexTo].sub(y).sub(1);
                 dyFee = v.dy.mul(self.swapFee).div(FEE_DENOMINATOR);
-                v.dy = v.dy.sub(dyFee).div(
-                    v.tokenPrecisionMultipliers[v.metaIndexTo]
-                );
+                v.dy = v.dy.sub(dyFee).mul(PRECISION).div(v.scaleMultipliers[v.metaIndexTo]);
             }
-
-            if (tokenIndexTo >= baseLPTokenIndex) {
+            if (tokenIndexTo >= BASE_LP_TOKEN_INDEX) {
                 // When swapping to a base Swap token, scale down dy by its virtual price
-                v.dy = v.dy.mul(BASE_VIRTUAL_PRICE_PRECISION).div(
+                v.dy = v.dy.mul(PRECISION).div(
                     v.baseVirtualPrice
                 );
             }
@@ -805,8 +872,8 @@ library DriftingMetaSwapUtils {
                 uint256 dyAdminFee = dyFee.mul(self.adminFee).div(
                     FEE_DENOMINATOR
                 );
-                dyAdminFee = dyAdminFee.div(
-                    v.tokenPrecisionMultipliers[v.metaIndexTo]
+                dyAdminFee = dyAdminFee.mul(PRECISION).div(
+                    v.scaleMultipliers[v.metaIndexTo]
                 );
                 self.balances[v.metaIndexFrom] = v
                     .oldBalances[v.metaIndexFrom]
@@ -817,13 +884,13 @@ library DriftingMetaSwapUtils {
                     .sub(dyAdminFee);
             }
 
-            if (tokenIndexTo >= baseLPTokenIndex) {
+            if (tokenIndexTo >= BASE_LP_TOKEN_INDEX) {
                 // When swapping to a token that belongs to the base Swap, burn the LP token
                 // and withdraw the desired token from the base pool
                 uint256 oldBalance = v.tokenTo.balanceOf(address(this));
                 baseSwap.removeLiquidityOneToken(
                     v.dy,
-                    tokenIndexTo - baseLPTokenIndex,
+                    tokenIndexTo - BASE_LP_TOKEN_INDEX,
                     0,
                     block.timestamp
                 );
@@ -837,8 +904,8 @@ library DriftingMetaSwapUtils {
             // Do a swap through the base Swap
             v.dy = v.tokenTo.balanceOf(address(this));
             baseSwap.swap(
-                tokenIndexFrom - baseLPTokenIndex,
-                tokenIndexTo - baseLPTokenIndex,
+                tokenIndexFrom - BASE_LP_TOKEN_INDEX,
+                tokenIndexTo - BASE_LP_TOKEN_INDEX,
                 v.dx,
                 minDy,
                 block.timestamp
@@ -893,7 +960,7 @@ library DriftingMetaSwapUtils {
             0,
             self._getAPrecise(),
             _updateBaseVirtualPrice(driftingMetaSwapStorage),
-            self.tokenPrecisionMultipliers,
+            _getScaleMultipliers(self, driftingMetaSwapStorage),
             self.balances
         );
         v.totalSupply = v.lpToken.totalSupply();
@@ -902,7 +969,7 @@ library DriftingMetaSwapUtils {
             v.d0 = SwapUtils.getD(
                 _xp(
                     v.newBalances,
-                    v.tokenPrecisionMultipliers,
+                    v.scaleMultipliers,
                     v.baseVirtualPrice
                 ),
                 v.preciseA
@@ -937,7 +1004,7 @@ library DriftingMetaSwapUtils {
 
         // invariant after change
         v.d1 = SwapUtils.getD(
-            _xp(v.newBalances, v.tokenPrecisionMultipliers, v.baseVirtualPrice),
+            _xp(v.newBalances, v.scaleMultipliers, v.baseVirtualPrice),
             v.preciseA
         );
         require(v.d1 > v.d0, "D should increase");
@@ -964,7 +1031,7 @@ library DriftingMetaSwapUtils {
             v.d2 = SwapUtils.getD(
                 _xp(
                     v.newBalances,
-                    v.tokenPrecisionMultipliers,
+                    v.scaleMultipliers,
                     v.baseVirtualPrice
                 ),
                 v.preciseA
@@ -1019,6 +1086,7 @@ library DriftingMetaSwapUtils {
 
         (dy, dyFee) = _calculateWithdrawOneToken(
             self,
+            driftingMetaSwapStorage,
             tokenAmount,
             tokenIndex,
             _updateBaseVirtualPrice(driftingMetaSwapStorage),
@@ -1073,7 +1141,7 @@ library DriftingMetaSwapUtils {
             0,
             self._getAPrecise(),
             _updateBaseVirtualPrice(driftingMetaSwapStorage),
-            self.tokenPrecisionMultipliers,
+            _getScaleMultipliers(self, driftingMetaSwapStorage),
             self.balances
         );
         v.totalSupply = v.lpToken.totalSupply();
@@ -1097,7 +1165,7 @@ library DriftingMetaSwapUtils {
             v.d0 = SwapUtils.getD(
                 _xp(
                     v.newBalances,
-                    v.tokenPrecisionMultipliers,
+                    v.scaleMultipliers,
                     v.baseVirtualPrice
                 ),
                 v.preciseA
@@ -1109,7 +1177,7 @@ library DriftingMetaSwapUtils {
                 );
             }
             v.d1 = SwapUtils.getD(
-                _xp(balances1, v.tokenPrecisionMultipliers, v.baseVirtualPrice),
+                _xp(balances1, v.scaleMultipliers, v.baseVirtualPrice),
                 v.preciseA
             );
 
@@ -1124,7 +1192,7 @@ library DriftingMetaSwapUtils {
             }
 
             v.d2 = SwapUtils.getD(
-                _xp(balances1, v.tokenPrecisionMultipliers, v.baseVirtualPrice),
+                _xp(balances1, v.scaleMultipliers, v.baseVirtualPrice),
                 v.preciseA
             );
         }
